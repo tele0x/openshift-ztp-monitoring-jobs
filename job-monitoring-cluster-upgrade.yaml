@@ -1,0 +1,207 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-monitor-cluster-upgrade
+  namespace: ztp-group
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  template:
+    spec:
+      containers:
+      - command:
+          - /bin/bash
+          - "-c"
+          - |
+                /bin/bash <<'EOF'
+                # Script to monitor cluster upgrade using TALM (Topology-Aware Lifecycle Management)
+                # Author: Federico 'tele' Rossi <ferossi@redhat.com>
+                #
+                function logc() {
+                    txt=$1
+                    echo -e "[`date '+%m-%d-%Y %H:%M:%S'`] $txt" 
+                }
+   
+                # the managedclusterview is used to monitor the detailed cluster progress
+                function create_managed_view() {
+                   cr=$1
+                   logc "Create ManagedClusterView for $cr"
+                   echo -e "apiVersion: view.open-cluster-management.io/v1beta1\nkind: ManagedClusterView\nmetadata:\n   name: upgrade-view\n   namespace: ${cr}\nspec:\n   scope:\n      apiGroup: config.openshift.io\n      kind: ClusterVersion\n      name: version\n      resource: clusterversions.config.openshift.io" | oc apply -f -
+                }
+
+                function get_cgu_name() {
+                  ct=0
+                  while [[ $ct -le 10 ]]; do
+                     CGU_TMP_NAME=`oc get clustergroupupgrade -n ztp-group --sort-by=.metadata.creationTimestamp | tail -1 | awk '{print $1}'`
+                     if [ ! -z "$CGU_TMP_NAME" ]; then
+                        echo $CGU_TMP_NAME
+                        break
+                     fi
+
+                     sleep 10
+                     ct=$(($ct+1))
+                  done
+                }
+ 
+                logc "START Cluster upgrade monitor"
+                logc "============================="
+                CLUSTER_UPGRADE_START_TIME=`date +%s`
+   
+                logc "Start monitoring CGU"
+                logc "Get latest CGU..."
+                CGU_NAME=`get_cgu_name`
+
+                # First monitor the cluster prep to update ClusterVersion for upgrade
+                ct=0
+                while [[ $ct -le 20 ]]; do
+                   CGU_STATUS=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0].status}'`
+                   CGU_MESSAGE=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0].message}'`
+                   CGU_REASON=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0].reason}'`
+
+                   if [[ "$CGU_REASON" != "UpgradeCannotStart" ]]; then
+                      logc "CGU not ready: $CGU_MESSAGE"
+                   elif [[ "$CGU_REASON" == "UpgradeNotCompleted" ]]; then
+                      logc "CGU ready for new patched CGU"
+                      oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0]}'
+                      echo
+                      break
+                   elif [[ "$CGU_REASON" == "UpgradeCompleted" ]]; then
+                      logc "CGU ready to move to bakup process"
+                      oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0]}'
+                      echo
+                      break
+                   fi
+ 
+                   sleep 10
+                   ct=$(($ct+1))
+                done
+                
+                # Deploy CGU to trigger the backup, no preCaching used in this case
+                logc "Deploy CGU to trigger the backup"
+                oc get clustergroupupgrade $CGU_NAME -n ztp-group -o yaml | sed '/^  uid: /d; /^  resourceVersion: /d; /^  creationTimestamp: /d; /^  selfLink: /d; /^status:$/Q; /^  finalizers: /d;' | grep -v finalizer | sed 's/platform-upgrade-prep/platform-upgrade/g' | grep -v 'generation:' | grep -v annotations | grep -v last-applied-config | sed -e 's/backup: false/backup: true/g' | sed -e 's/enable: true/enable: false/g' | oc apply -f -
+                
+                logc "CGU created: "
+                oc get clustergroupupgrade cgu-platform-upgrade -n ztp-group -o yaml
+                
+                CGU_NAME=`get_cgu_name`
+
+                # Monitor backup and CGU readiness during upgrade
+                logc "Monitor backup and CGU readiness: "
+                BACKUP_STATUS=0
+                ct=0
+                while [[ $ct -le 60 ]]; do
+
+                  # get upgrade type and status
+                  CGU_STATUS=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0].status}'`
+                  CGU_TYPE=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0].type}'`
+                 
+                  # the first type should be backup completed 
+                  if [[ "$CGU_TYPE" == "BackupDone" ]]; then
+                     case $CGU_STATUS in
+                        False)
+                           logc "Backup not completed: "
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0]}'
+                           echo
+                           ;;
+
+                        True)
+                           logc "Backup completed: "
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0]}'
+                           echo
+                           BACKUP_STATUS=1
+                           ;;
+
+                        *)
+                           logc "Backup status unknown: "
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[0]}'
+                           echo
+                           ;;
+                     esac
+                  
+                     if [[ $BACKUP_STATUS -eq 1 ]]; then
+                        logc "Backup successfull ready for cluster upgrade"
+                        break;
+                     fi
+                  fi 
+
+                  # wait 3 minutes before checking CGU status
+                  logc "Waiting to check cluster backup status.."
+                  sleep 90
+                  ct=$(($ct+1))
+                done
+     
+
+                logc "Patch CGU to trigger upgrade process: "
+                oc patch clustergroupupgrade $CGU_NAME -n ztp-group --patch '{"spec":{"enable":true, "preCaching": false}}' --type=merge
+
+                logc "Monitor upgrade progress"
+                ct=0
+                while [[ $ct -le 80 ]]; do
+                  # get upgrade type and status
+                  CGU_STATUS=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[1].status}'`
+                  CGU_TYPE=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[1].type}'`
+                     
+                  CGU_TMP_CLUSTERS=`oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.backup.clusters}'`
+                  TMP_C=`echo $CGU_TMP_CLUSTERS | tr -d '[' | tr -d ']' | tr -d '"'`
+                  IFS=',' read -r -a CGU_CLUSTERS <<< $TMP_C
+  
+                  if [[ "$CGU_TYPE" == "Ready" ]]; then
+                     case $CGU_STATUS in
+                        True)
+                           logc "ClusterGroupUpgrade compliant"
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[1]}'
+                           echo
+                           break
+                           ;;
+                        False)
+                           logc "ClusterGroupUpgrade: "
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[1]}'
+                           echo
+                           logc "Get clusters remediation status"
+                           for CURR_CLUSTER in "${CGU_CLUSTERS}"; do
+                              # if managed view doesn't exist create it
+                              if ! ( oc get managedclusterview upgrade-view -n $CURR_CLUSTER > /dev/null); then
+                                create_managed_view $CURR_CLUSTER
+                              fi
+
+                              CLUSTER_STATUS=`oc get clustergroupupgrade cgu-platform-upgrade -n ztp-group -o jsonpath="{.status.status.currentBatchRemediationProgress.$CURR_CLUSTER.state}"`
+                              
+                              logc "Cluster $CURR_CLUSTER remediation status: $CLUSTER_STATUS";
+                              # cluster is upgrading get detailed status
+                              oc get managedclusterview upgrade-view -n $CURR_CLUSTER -o jsonpath='{.status.result.status.conditions[*]}' | tr ',' '\n' | grep -B 5 Progressing | grep message
+                              echo
+                           done
+                           ;;
+                        *)
+                           logc "ClusterGroupUpgrade status is unknown: "
+                           oc get clustergroupupgrade $CGU_NAME -n ztp-group -o jsonpath='{.status.conditions[1]}'
+                           echo
+                           ;;
+                     esac
+                  fi
+                       
+                  # wait 3 minutes before checking CGU status
+                  logc "Waiting to check cluster upgrade status.."
+                  sleep 90
+                  ct=$(($ct+1))
+                done
+
+                logc "============================="
+    
+                CLUSTER_UPGRADE_END_TIME=`date +%s`
+                logc "CLUSTER_UPGRADE_START_TIME: `date -d @${CLUSTER_UPGRADE_START_TIME} '+%m-%d-%Y %H:%M:%S'`"
+                logc "CLUSTER_UPGRADE_END_TIME: `date -d @${CLUSTER_UPGRADE_END_TIME} '+%m-%d-%Y %H:%M:%S'`"
+
+                CLUSTER_UPGRADE_TOTAL_TIME=`echo $(( $CLUSTER_UPGRADE_END_TIME - $CLUSTER_UPGRADE_START_TIME )) | awk '{printf "%d:%02d:%02d", $1/3600, ($1/60)%60, $1%60}'`
+                logc "END Cluster upgrade time: $CLUSTER_UPGRADE_TOTAL_TIME"
+
+                # notify upgrade completed
+                RESP_START_TIME=`date -d @${CLUSTER_UPGRADE_START_TIME} '+%m-%d-%Y %H:%M:%S'`
+                RESP_END_TIME=`date -d @${CLUSTER_UPGRADE_END_TIME} '+%m-%d-%Y %H:%M:%S'`
+
+                curl -v -X POST -H 'Content-Type: application/json' -d "{\"type\": \"CLUSTER_UPDATE_REPLY\", \"cluster\": \"$CGU_CLUSTERS\", \"start_time\": \"$RESP_START_TIME\", \"end_time\": \"$RESP_END_TIME\", \"duration\": \"$CLUSTER_UPGRADE_TOTAL_TIME\", \"state\": \"SUCCESS\", \"reason\": \"\"}" http://ztpintegration-amq.apps.ztphub.fedge.lab.com/ztp
+
+                EOF
+        name: monitor-cluster-upgrade
+        image: registry.redhat.io/openshift4/ose-cli
+      restartPolicy: Never

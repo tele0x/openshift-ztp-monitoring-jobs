@@ -1,0 +1,269 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-monitor-cluster-install
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  template:
+    spec:
+      containers:
+      - command:
+          - /bin/bash
+          - "-c"
+          - |
+                /bin/bash <<'EOF'
+                # Script to monitor ZTP (Zero Touch Provisioning) cluster installation
+                # Author: Federico 'tele' Rossi <ferossi@redhat.com>
+                #
+                function logc() {
+                    txt=$1
+                    echo -e "[`date '+%m-%d-%Y %H:%M:%S'`] $txt" 
+                }
+    
+                function collect_logs() {
+                  ACI=$1
+                  # cluster events
+                  CLUSTER_EVENTS=`oc get agentclusterinstall $ACI -o jsonpath='{.status.debugInfo.eventsURL}'`
+                  # cluster logs
+                  CLUSTER_LOGS=`oc get agentclusterinstall $ACI -o jsonpath='{.status.debugInfo.logsURL}'`
+    
+                  logc "Cluster install events"
+                  logc "=============================="
+                  curl -k -X GET "$CLUSTER_EVENTS"
+    
+                  logc "Get cluster install logs"
+                  cd /tmp
+                  curl -k -o logs.tar -X GET "$CLUSTER_LOGS"
+                  tar -xf logs.tar
+                  tar -zxvf controller_logs.tar.gz
+                  logc "Install logs:"
+                  logc "============================="
+                  cat assisted-installer*
+                }
+    
+                ct=0
+                INSTALL_STATUS=0
+    
+                CLUSTER_START_TIME=`date +%s`
+                logc "START Cluster monitor install"
+                logc "============================="
+    
+                BM_CHECK=0
+                logc "Check BareMetalNodes readiness"
+                # Wait for BaremetalNodes to be ready and registered
+                while [[ $ct -le 10 ]]; do
+                  res=`oc get bmh | sed 1d | awk '{print $1}' |  xargs oc get bmh -o jsonpath='{.status.operationalStatus}' 2>/dev/null`
+                  echo -e "RES: $res"
+                  if [ "$res" == "error" ]; then
+                    logc "Error detected on BMH:"
+                    oc get bmh | sed 1d | awk '{print $1}' | xargs oc get bmh -o jsonpath='{.status.errorMessage}'
+                    echo
+                  else
+                    logc "No errors detected"
+                    oc get bmh
+                    BM_CHECK=1
+                  fi
+    
+                  if [[ $BM_CHECK -eq 1 ]]; then
+                    break;
+                  fi
+                 
+                  # wait 2 minutes
+                  logc "Waiting to check baremetal nodes status.."
+                  sleep 60
+                  ct=$(($ct+1))
+                done
+
+                if [[ $BM_CHECK -eq 0 ]]; then
+                  logc "Baremetal nodes failure"
+                  exit
+                fi
+                
+                logc "Baremetal nodes ready for installation!"
+                
+
+
+                logc "Check agentclusterinstall readiness"
+                ct=0
+                while [[ $ct -le 10 ]]; do
+                  AGENT_NAME=`oc get agentclusterinstall | tail -1 | awk '{print $1}'`
+                  if [ -z "$AGENT_NAME" ]; then 
+                      logc "Agent name IS NULL"
+                  else
+                      echo "Agent name: $AGENT_NAME"
+                      break;
+                  fi
+                  
+                  sleep 10
+                  ct=$(($ct+1))
+                done
+                logc "Start monitoring installation status"
+    
+                # reset counter
+                ct=0
+                # Give 1 hour for install time, timeout if cluster installation is not completed in 1 hour
+                while [[ $ct -le 80 ]]; do
+                  
+                  # get install state
+                  INSTALL_STATUS=`oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.debugInfo.state}'`
+                  # get install state details
+                  INSTALL_STATUS_MSG=`oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.debugInfo.stateInfo}'`
+    
+                  case $INSTALL_STATUS in
+                    
+                    insufficient)
+                       logc "Cluster has not sufficient requirements to begin the installation"
+                       logc "NOTE: It usually means the host validation is not completed." 
+                       logc "      Agent still has to register to AI or it's registered and validation is failing."
+                       logc "      Give it some time and then check manually agentclusterinstall for any error"
+                       ;;
+    
+                    preparing-for-installation)
+                       logc "Preparing for cluster installation"
+                       ;;
+    
+                    installing)
+                       logc "Installation in progress.."
+                       logc "Status: $INSTALL_STATUS_MSG"
+                       ;; 
+    
+                    installing-pending-user-action)
+                       logc "Installation is pending user action, error occured and stopped the install"
+                       logc "Output: $INSTALL_STATUS_MSG"
+                       ;;
+    
+                    finalizing)
+                       logc "`oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.conditions[3].message}'`"
+                       ;;
+    
+                    installed)
+                       logc "Cluster successfully installed"
+                       INSTALL_STATUS=1
+                       break;
+                       ;;
+    
+                    ## mabe
+                    adding-hosts)
+                       logc "Adding-host state"
+                       INSTALL_STATUS=1
+                       break;
+                       ;;
+    
+                    *)
+                       logc "Status unknown"
+                       logc "Output: `oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.debugInfo.stateInfo}'`"
+                       ;;
+                  esac
+    
+                  if [[ $INSTALL_STATUS -eq 1 ]]; then
+                    break;
+                  fi
+    
+                  # wait 3 minutes before checking again cluster status
+                  logc "Waiting to check cluster status.."
+                  sleep 90
+                  ct=$(($ct+1))
+                done
+    
+                logc "============================="
+    
+                CLUSTER_END_TIME=`date +%s`
+                logc "CLUSTER_START_TIME: $CLUSTER_START_TIME"
+                CLUSTER_TOTAL_TIME=`echo $(( $CLUSTER_END_TIME - $CLUSTER_START_TIME )) | awk '{printf "%d:%02d:%02d", $1/3600, ($1/60)%60, $1%60}'`
+                logc "END Installation time: $CLUSTER_TOTAL_TIME"
+    
+                if [[ $INSTALL_STATUS -eq 1 ]]; then
+                  logc "Cluster installation completed, get kubeconfig and kubeadmin password for the cluster"
+                  
+                  # For this PoC we just print the password and kubeconfig in the pod log
+                  # Other options would be to send Slack notification or an email with the cluster access info
+                  # Using curl instead of getting the secrets
+                  # KUBECONFIG_URL=`oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.debugInfo.eventsURL}' | sed -e 's#\(.*\)/events?\(.*\)#\1/downloads/kubeconfig?\2#g'`
+                  # KUBEADMIN_URL=`oc get agentclusterinstall $AGENT_NAME -o jsonpath='{.status.debugInfo.eventsURL}' | sed -e 's#\(.*\)/events?\(.*\)#\1/downloads/files?file_name=kubeadmin-password\&\2#g'`
+                  # logc "Kubeadmin password: "
+                  # curl -k -X GET "$KUBEADMIN_URL" 2>/dev/null
+                  # echo -e "\n"
+                  # logc "Kubeconfig: "
+                  # curl -k -X GET "$KUBECONFIG_URL" 2>/dev/null
+    
+                  logc "Kubeadmin password: "
+                  NS=`oc get sa -o=jsonpath='{.items[0]..metadata.namespace}'`
+                  oc get secret $NS-admin-password -o jsonpath='{.data.password}' | base64 --decode
+                  echo -e "\n"
+                  logc "Kubeconfig: "
+                  oc get secret $NS-admin-kubeconfig -o jsonpath='{.data.kubeconfig}' | base64 --decode
+    
+    
+                  # If your ZTP process includes policy deployment
+                  # Monitor policy deployment        
+                  POLICY_START_TIME=`date +"%s"`
+                  logc "Start policies deployment monitoring"
+                  # reset counter
+                  ct=0
+                  # Give 1 hour for policies deployment time
+                  while [[ $ct -le 40 ]]; do
+                    POLICY_STATUS=`oc get managedcluster $AGENT_NAME -o jsonpath='{.metadata.labels}'`
+                    if (echo $POLICY_STATUS | grep ztp-running > /dev/null ); then
+                       logc "Applying policies.. status: ztp-running"
+                    elif (echo $POLICY_STATUS | grep ztp-done > /dev/null ); then
+                       logc "Policies deployment done! status: ztp-done"
+                      POLICY_END_TIME=`date +"%s"`
+                       break;
+                    fi
+    
+                    # wait 3 minutes before checking again cluster status
+                    logc "Waiting to check policy apply status.."
+                    sleep 90
+                    ct=$(($ct+1))
+                  done
+                  
+                  collect_logs $AGENT_NAME
+    
+                  logc "Summary Deployment"
+                  logc "======================"
+                  logc "Cluster install start time: `date -d @$CLUSTER_START_TIME '+%m-%d-%Y %H:%M:%S'`"
+                  logc "Cluster install stop time: `date -d @$CLUSTER_END_TIME '+%m-%d-%Y %H:%M:%S'`"
+                  logc "Cluster install total time: $CLUSTER_TOTAL_TIME\n"
+                  logc "Policies deployment start time: `date -d @$POLICY_START_TIME '+%m-%d-%Y %H:%M:%S'`"
+                  logc "Policies deployment stop time: `date -d @$POLICY_END_TIME '+%m-%d-%Y %H:%M:%S'`"
+    
+    
+                  POLICY_TOTAL_TIME=`echo $(( $POLICY_END_TIME - $POLICY_START_TIME )) | awk '{printf "%d:%02d:%02d", $1/3600, ($1/60)%60, $1%60}'`
+                                
+                  logc "Policy deployment total time: $POLICY_TOTAL_TIME\n"
+    
+                  TOTAL_TIME=`echo $(( $POLICY_END_TIME - $CLUSTER_START_TIME )) | awk '{printf "%d:%02d:%02d", $1/3600, ($1/60)%60, $1%60}'`
+    
+                  logc "Total cluster installation and policy deployment time: $TOTAL_TIME"
+                  logc "JSON Data: \n"
+    
+                  echo "{\"cluster_name\": \"$NS\", \"total_deployment_time\": \"$TOTAL_TIME\", \"cluster_install_time\": \"$CLUSTER_TOTAL_TIME\", \"policy_deployment_time\": \"$POLICY_TOTAL_TIME\"}"
+   
+
+                  logc "Notify cluster $NS deployment is completed"
+                  RESP_START_TIME=`date -d @${CLUSTER_START_TIME} '+%m-%d-%Y %H:%M:%S'`
+                  RESP_END_TIME=`date -d @${POLICY_END_TIME} '+%m-%d-%Y %H:%M:%S'`
+                  curl -v -X POST -H 'Content-Type: application/json' -d "{\"type\": \"CREATE_CLUSTER_REPLY\", \"cluster_name\": \"$NS\", \"start_time\": \"$RESP_START_TIME\", \"end_time\": \"$RESP_END_TIME\", \"duration\": \"$TOTAL_TIME\", \"state\": \"SUCCESS\", \"reason\": \"\"}" http://ztpintegration-amq.apps.ztphub.fedge.lab.com/ztp
+
+   
+                  exit 0
+                else
+                  logc "Cluster installation failed"
+                  collect_logs $AGENT_NAME
+
+                  NS=`oc get sa -o=jsonpath='{.items[0]..metadata.namespace}'`
+                  logc "Send notification cluster $NS installation failed"
+
+                  RESP_START_TIME=`date -d @${CLUSTER_START_TIME} '+%m-%d-%Y %H:%M:%S'`
+                  RESP_END_TIME=`date +'%m-%d-%Y %H:%M:%S'`
+
+                  curl -v -X POST -H 'Content-Type: application/json' -d "{\"type\": \"CREATE_CLUSTER_REPLY\", \"cluster_name\": \"$NS\", \"start_time\": \"$RESP_START_TIME\", \"end_time\": \"$RESP_END_TIME\", \"state\": \"FAILED\", \"reason\": \"\"}" http://ztpintegration-amq.apps.ztphub.fedge.lab.com/ztp
+
+                  exit 1
+                fi
+    
+                EOF
+        name: monitor-cluster-install
+        image: registry.redhat.io/openshift4/ose-cli
+      restartPolicy: Never
